@@ -25,6 +25,7 @@ type Chunker struct {
 
 	maskS uint64
 	maskL uint64
+	salt  uint64
 
 	rd io.Reader
 
@@ -36,7 +37,7 @@ type Chunker struct {
 
 // Options configures the options for the Chunker.
 type Options struct {
-	// NormalSize is the target chunk size. Typically a power of 2. It must be in the
+	// AverageSize is the target chunk size. Typically a power of 2. It must be in the
 	// range 64B to 1GiB.
 	AverageSize int
 
@@ -48,14 +49,9 @@ type Options struct {
 	// AverageSize * 4.
 	MaxSize int
 
-	// (Optional) Sets the chunk normalization level. It may be set to 1, 2 or 3,
-	// unless DisableNormalization is set, in which case it's ignored. By default,
-	// it's set to 2.
+	// (Optional) Sets the chunk normalization level. It may be set to 1, 2 or 3.
+	// If it is set to negative values, normalization is disabled.
 	Normalization int
-
-	// (Optional) DisableNormalization turns normalization off. By default, it's set to
-	// false.
-	DisableNormalization bool
 
 	// (Optional) Seed alters the lookup table of the rolling hash algorithm to mitigate
 	// chunk-size based fingerprinting attacks. It may be set to a random uint64.
@@ -78,8 +74,16 @@ func (opts *Options) setDefaults() {
 	if opts.BufSize == 0 {
 		opts.BufSize = opts.MaxSize * 2
 	}
-	if !opts.DisableNormalization && opts.Normalization == 0 {
+
+	// If unset, set it to 2 - unless explicitly disabled
+	switch {
+	case opts.Normalization < 0:
+		opts.Normalization = 0
+
+	case opts.Normalization == 0:
 		opts.Normalization = 2
+
+	default:
 	}
 }
 
@@ -101,22 +105,23 @@ type Chunk struct {
 
 // NewChunker returns a Chunker with the given Options.
 func NewChunker(rd io.Reader, opts Options) (*Chunker, error) {
+	return newChunker(rd, nil, opts)
+}
+
+// NewBufChunker returns a Chunker from an input buffer and given options
+func NewBufChunker(buf []byte, opts Options) (*Chunker, error) {
+	return newChunker(nil, buf, opts)
+}
+
+func newChunker(rd io.Reader, buf []byte, opts Options) (*Chunker, error) {
 	opts.setDefaults()
 	if err := opts.validate(); err != nil {
 		return nil, err
 	}
 
-	for i := 0; i < len(table); i++ {
-		table[i] = table[i] ^ opts.Seed
-	}
-
-	normalization := opts.Normalization
-	if opts.DisableNormalization {
-		normalization = 0
-	}
 	bits := int(math.Round(math.Log2(float64(opts.AverageSize))))
-	smallBits := bits + normalization
-	largeBits := bits - normalization
+	smallBits := bits + opts.Normalization
+	largeBits := bits - opts.Normalization
 
 	chunker := &Chunker{
 		minSize:  opts.MinSize,
@@ -124,15 +129,28 @@ func NewChunker(rd io.Reader, opts Options) (*Chunker, error) {
 		normSize: opts.AverageSize,
 		maskS:    (1 << smallBits) - 1,
 		maskL:    (1 << largeBits) - 1,
+		salt:     opts.Seed,
 		rd:       rd,
-		buf:      make([]byte, opts.BufSize),
-		cursor:   opts.BufSize,
+		buf:      buf,
+	}
+
+	if rd != nil {
+		chunker.buf = make([]byte, opts.BufSize)
+		chunker.cursor = opts.BufSize
 	}
 
 	return chunker, nil
 }
 
 func (c *Chunker) fillBuffer() error {
+	// mmap'd buffer - no need to copy
+	if c.rd == nil {
+		if c.cursor >= len(c.buf) {
+			c.eof = true
+		}
+		return nil
+	}
+
 	n := len(c.buf) - c.cursor
 	if n >= c.maxSize {
 		return nil
@@ -164,7 +182,7 @@ func (c *Chunker) Next() (Chunk, error) {
 	if err := c.fillBuffer(); err != nil {
 		return Chunk{}, err
 	}
-	if len(c.buf) == 0 {
+	if len(c.buf) == 0 || c.eof {
 		return Chunk{}, io.EOF
 	}
 
@@ -192,16 +210,15 @@ func (c *Chunker) nextChunk(data []byte) (int, uint64) {
 	}
 
 	n := min(len(data), c.maxSize)
-
-	for ; i < min(n, c.normSize); i++ {
-		fp = (fp << 1) + table[data[i]]
+	for m := min(n, c.normSize); i < m; i++ {
+		fp = (fp << 1) + (table[data[i]] ^ c.salt)
 		if (fp & c.maskS) == 0 {
 			return i + 1, fp
 		}
 	}
 
 	for ; i < n; i++ {
-		fp = (fp << 1) + table[data[i]]
+		fp = (fp << 1) + (table[data[i]] ^ c.salt)
 		if (fp & c.maskL) == 0 {
 			return i + 1, fp
 		}
@@ -226,7 +243,7 @@ func (opts Options) validate() error {
 	if opts.AverageSize > opts.MaxSize || opts.AverageSize < opts.MinSize {
 		return errors.New("option AverageSize must be betweeen MinSize and MaxSize")
 	}
-	if !opts.DisableNormalization && (opts.Normalization <= 0 || opts.Normalization > 4) {
+	if opts.Normalization > 4 {
 		return errors.New("option Normalization must be 0, 1, 2 or 3")
 	}
 	if opts.BufSize <= opts.MaxSize {

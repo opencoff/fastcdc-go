@@ -79,7 +79,8 @@ func TestChunking(t *testing.T) {
 
 func TestChunkingRandom(t *testing.T) {
 	data := randBytes(1e6, 63)
-	chunker, err := NewChunker(bytes.NewReader(data), defaultOpts)
+	//chunker, err := NewChunker(bytes.NewReader(data), defaultOpts)
+	chunker, err := NewBufChunker(data, defaultOpts)
 	assertNoError(t, err)
 
 	var prevOffset int
@@ -114,8 +115,8 @@ func TestMinSize(t *testing.T) {
 	// Test with data smaller than min chunk size
 	data := randBytes(10, 51)
 	opts := defaultOpts
-	opts.DisableNormalization = true
-	chunker, err := NewChunker(bytes.NewReader(data), opts)
+	opts.Normalization = -1
+	chunker, err := NewBufChunker(data, opts)
 	assertNoError(t, err)
 
 	c, err := chunker.Next()
